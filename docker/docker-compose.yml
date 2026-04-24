@@ -1,0 +1,31 @@
+version: "3.9"
+services:
+  netsentinel:
+    build: ..
+    ports:
+      - "8501:8501"   # Streamlit dashboard
+      - "8000:8000"   # Prometheus metrics
+    volumes:
+      - ../data:/app/data
+      - ../models:/app/models
+      - ../mlruns:/app/mlruns
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
+      - LANGCHAIN_TRACING_V2=true
+    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    ports:
+      - "5000:5000"
+    volumes:
+      - ../mlruns:/mlruns
+    command: mlflow server --host 0.0.0.0 --backend-store-uri /mlruns
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml

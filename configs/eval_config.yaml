@@ -1,0 +1,29 @@
+evaluation:
+  n_eval_samples: 500
+  n_episodes: 10
+  deterministic: true
+
+mlflow:
+  tracking_uri: ./mlruns
+  experiment_name: netsentinel-rl
+  auto_log: true
+
+prometheus:
+  enabled: true
+  port: 8000
+
+metrics:
+  primary: f1_weighted
+  secondary:
+    - precision
+    - recall
+    - false_positive_rate
+    - shap_grounded_rate
+    - hallucination_rate
+    - p95_latency_ms
+  targets:
+    f1_weighted: 0.95
+    false_positive_rate: 0.02
+    shap_grounded_rate: 0.90
+    hallucination_rate: 0.03
+    p95_latency_ms: 200

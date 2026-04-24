@@ -1,0 +1,11 @@
+name: netsentinel
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - cudatoolkit=11.8
+  - pip:
+    - -r requirements.txt
