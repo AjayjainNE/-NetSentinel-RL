@@ -1,4 +1,4 @@
-# NetSentinel-RL 🛡️
+# NetSentinel-RL 
 
 > **Autonomous Network Threat Response via Multi-Agent Reinforcement Learning with Interpretable LLM Orchestration**
 
@@ -11,13 +11,13 @@ A production-grade, interpretable multi-agent reinforcement learning system for 
 
 ---
 
-## 🎯 Motivation
+## Motivation
 
 After years as a network engineer watching SOC analysts drown in false positives from rule-based SIEMs, I built the system I wish existed: one that detects threats with RL precision, explains every decision in plain English, and can be trusted in production because it shows its work.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 Real Network Data (CICIDS-2017 / KDD Cup / Live pcap)
@@ -42,7 +42,7 @@ Real Network Data (CICIDS-2017 / KDD Cup / Live pcap)
         └──────────────────────┘
 ```
 
-## 🤗 Hugging Face Tasks Used
+## Hugging Face Tasks Used
 
 | Task | Usage |
 |------|-------|
@@ -55,7 +55,7 @@ Real Network Data (CICIDS-2017 / KDD Cup / Live pcap)
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 # 1. Clone
@@ -79,7 +79,7 @@ streamlit run dashboard/app.py
 
 ---
 
-## 📓 Notebooks
+## Notebooks
 
 | Notebook | Description |
 |----------|-------------|
@@ -94,7 +94,7 @@ streamlit run dashboard/app.py
 
 ---
 
-## 📊 Key Results
+## Key Results
 
 | Metric | Value | Baseline |
 |--------|-------|----------|
@@ -106,7 +106,7 @@ streamlit run dashboard/app.py
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 - **RL**: Stable-Baselines3, RLlib, custom Gym environment
 - **NLP/HF**: transformers, datasets, evaluate (DistilBERT, sentence-transformers)
@@ -118,7 +118,7 @@ streamlit run dashboard/app.py
 
 ---
 
-## 📄 License
+## License
 
 MIT
 
@@ -126,4 +126,4 @@ MIT
 
 ## 👤 Author
 
-Independent research project during MSc Applied Data Science (Deep Learning specialisation). Motivated by 6+ years of network engineering experience.
+Researcher @ RHUL | London - MSc Applied Data Science (Deep Learning specialisation). Motivated by 6+ years of network engineering experience.
