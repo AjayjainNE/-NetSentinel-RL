@@ -374,8 +374,7 @@ with placeholder.container():
                 hole=0.55,
                 hovertemplate="%{label}: %{value} (%{percent})<extra></extra>",
             ))
-            fig_pie.update_layout(**base_layout(240), showlegend=False,
-                                   margin=dict(l=0, r=0, t=20, b=0))
+            fig_pie.update_layout(**{**base_layout(240),"margin": dict(l=0, r=0, t=20, b=0)})
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
             st.success("No threats in current window.")
@@ -399,8 +398,10 @@ with placeholder.container():
             textposition="outside",
             textfont=dict(size=8),
         ))
-        fig_act.update_layout(**base_layout(240), showlegend=False,
-                               xaxis_title="Count", margin=dict(l=0, r=40, t=20, b=10))
+        layout = base_layout(240)
+        layout.pop("margin", None)
+
+        fig_act.update_layout(**layout,xaxis_title="Count",margin=dict(l=0, r=40, t=20, b=10))
         st.plotly_chart(fig_act, use_container_width=True)
 
     # ── Row 3: Latency + confidence + MARL ───────────────────────────────
@@ -452,8 +453,7 @@ with placeholder.container():
                 textposition="outside",
                 textfont=dict(size=9),
             ))
-            fig_det.update_layout(**base_layout(200), showlegend=False,
-                                   yaxis_title="Flows")
+            fig_det.update_layout(**base_layout(200), yaxis_title="Flows")
             st.plotly_chart(fig_det, use_container_width=True)
         else:
             st.empty()
@@ -487,9 +487,7 @@ with placeholder.container():
                     textposition="outside",
                     textfont=dict(size=8),
                 ))
-                fig_shap.update_layout(**base_layout(220), showlegend=False,
-                                        xaxis_title="Mean |SHAP|",
-                                        margin=dict(l=0, r=50, t=20, b=10))
+                fig_shap.update_layout(**base_layout(220),xaxis_title="Mean |SHAP|",margin=dict(l=0, r=50, t=20, b=10))
                 st.plotly_chart(fig_shap, use_container_width=True)
 
     with col_g:
