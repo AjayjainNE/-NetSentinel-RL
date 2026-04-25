@@ -553,7 +553,7 @@ with placeholder.container():
             textposition="outside",
             textfont=dict(size=9),
         ))
-        fig_sev.update_layout(**base_layout(210), showlegend=False, yaxis_title="Count")
+        fig_sev.update_layout(**base_layout(210), yaxis_title="Count")
         st.plotly_chart(fig_sev, use_container_width=True)
 
     # ── Row 6: Live alert feed ────────────────────────────────────────────
