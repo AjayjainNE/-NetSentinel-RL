@@ -1,115 +1,117 @@
 """
 NetSentinel-RL — Detector Agent
-PPO-based binary threat detector trained on the custom NetworkEnv.
+PPO-based binary threat detector with self-attention over sliding flow windows.
 """
 
 from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import torch
+import torch.nn as nn
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-import torch.nn as nn
-from pathlib import Path
-import logging
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 log = logging.getLogger(__name__)
 
 
 class AttentionFlowExtractor(BaseFeaturesExtractor):
     """
-    Custom feature extractor with a lightweight self-attention mechanism
-    over the sliding window of flow observations.
+    Lightweight self-attention feature extractor.
 
-    This is the novel architectural contribution: treating the window
-    as a sequence and applying scaled dot-product attention before
-    feeding into the PPO MLP policy head.
+    The sliding window of flow observations is treated as a short sequence.
+    Scaled dot-product attention lets each position attend to all others
+    before the most-recent position is projected to the policy head.
+    This architecture allows the agent to exploit temporal correlations
+    (e.g. a burst of SYN packets preceding a DDoS) without the cost of
+    an LSTM or full Transformer.
     """
 
-    def __init__(self, observation_space, n_features: int, window_size: int = 5, d_model: int = 64):
-        features_dim = d_model
-        super().__init__(observation_space, features_dim)
+    def __init__(
+        self,
+        observation_space,
+        n_features: int,
+        window_size: int = 5,
+        d_model: int = 64,
+        n_heads: int = 4,
+    ) -> None:
+        super().__init__(observation_space, features_dim=d_model)
 
-        self.n_features = n_features
+        self.n_features  = n_features
         self.window_size = window_size
-        self.d_model = d_model
+        self.d_model     = d_model
 
-        # Project each flow in window to d_model
         self.input_proj = nn.Linear(n_features, d_model)
-        # Self-attention over window positions
-        self.attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
-        # Layer norm + final projection
-        self.norm = nn.LayerNorm(d_model)
+        self.attn       = nn.MultiheadAttention(d_model, num_heads=n_heads, batch_first=True)
+        self.norm       = nn.LayerNorm(d_model)
         self.output_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        batch_size = obs.shape[0]
-        # Reshape: (batch, window*features) -> (batch, window, features)
-        x = obs.view(batch_size, self.window_size, self.n_features)
-        # Project
+        # obs: (batch, window * features) → (batch, window, features)
+        x = obs.view(obs.shape[0], self.window_size, self.n_features)
         x = self.input_proj(x)
-        # Self-attention (current flow attends to history)
         attn_out, _ = self.attn(x, x, x)
         x = self.norm(x + attn_out)
-        # Pool: take representation of the most recent flow (last position)
-        x = x[:, -1, :]
-        return self.output_proj(x)
+        # Use the most-recent flow position as the pooled representation
+        return self.output_proj(x[:, -1, :])
 
 
-class ThreatDetectionCallback(BaseCallback):
+class DetectorMetricsCallback(BaseCallback):
     """
-    Custom callback tracking F1, precision, recall from environment info.
-    Logs to MLflow if available.
+    Tracks per-episode F1, false-positive rate, and false-negative rate;
+    logs to MLflow when available.
     """
 
-    def __init__(self, eval_freq: int = 2000, verbose: int = 0):
+    def __init__(self, eval_freq: int = 2_000, verbose: int = 0) -> None:
         super().__init__(verbose)
-        self.eval_freq = eval_freq
-        self.episode_f1s: list = []
-        self.episode_fps: list = []
-        self.episode_fns: list = []
+        self.eval_freq   = eval_freq
+        self._f1_buf:    list[float] = []
+        self._fp_buf:    list[float] = []
+        self._fn_buf:    list[float] = []
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos", [])
-        for info in infos:
-            if "f1" in info and info.get("step", 0) % 100 == 0:
-                self.episode_f1s.append(info["f1"])
-                self.episode_fps.append(info.get("fp", 0))
-                self.episode_fns.append(info.get("fn", 0))
+        for info in self.locals.get("infos", []):
+            if "f1" in info:
+                self._f1_buf.append(info["f1"])
+                self._fp_buf.append(info.get("fp", 0))
+                self._fn_buf.append(info.get("fn", 0))
 
-        if self.num_timesteps % self.eval_freq == 0 and self.episode_f1s:
-            mean_f1 = np.mean(self.episode_f1s[-50:])
-            mean_fp = np.mean(self.episode_fps[-50:])
+        if self.num_timesteps % self.eval_freq == 0 and self._f1_buf:
+            mean_f1 = float(np.mean(self._f1_buf[-50:]))
+            mean_fp = float(np.mean(self._fp_buf[-50:]))
             if self.verbose > 0:
-                log.info(f"Step {self.num_timesteps:6d} | Mean F1: {mean_f1:.4f} | Mean FP: {mean_fp:.1f}")
+                log.info("step=%6d  F1=%.4f  FP_rate=%.2f", self.num_timesteps, mean_f1, mean_fp)
             try:
                 import mlflow
-                mlflow.log_metric("detector_f1", mean_f1, step=self.num_timesteps)
+                mlflow.log_metric("detector_f1",      mean_f1, step=self.num_timesteps)
                 mlflow.log_metric("detector_fp_rate", mean_fp, step=self.num_timesteps)
             except Exception:
                 pass
         return True
 
 
-def build_detector_agent(
+def build_detector(
     env,
     n_features: int,
     window_size: int = 5,
     learning_rate: float = 3e-4,
-    n_steps: int = 2048,
+    n_steps: int = 2_048,
     batch_size: int = 64,
     n_epochs: int = 10,
     gamma: float = 0.99,
     device: str = "auto",
 ) -> PPO:
-    """
-    Constructs the PPO detector agent with AttentionFlowExtractor.
-    """
+    """Construct the PPO detector with AttentionFlowExtractor policy."""
+
     policy_kwargs = dict(
         features_extractor_class=AttentionFlowExtractor,
         features_extractor_kwargs=dict(
@@ -117,11 +119,11 @@ def build_detector_agent(
             window_size=window_size,
             d_model=64,
         ),
-        net_arch=[dict(pi=[128, 64], vf=[128, 64])],
+        net_arch=[{"pi": [128, 64], "vf": [128, 64]}],
         activation_fn=nn.ReLU,
     )
 
-    model = PPO(
+    return PPO(
         "MlpPolicy",
         env,
         learning_rate=learning_rate,
@@ -131,14 +133,13 @@ def build_detector_agent(
         gamma=gamma,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,       # Entropy regularisation to prevent premature convergence
+        ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
         verbose=1,
         device=device,
     )
-    return model
 
 
 def train_detector(
@@ -149,27 +150,25 @@ def train_detector(
     total_timesteps: int = 500_000,
     save_path: str = "models/detector",
     n_envs: int = 4,
+    window_size: int = 5,
 ) -> PPO:
-    """Train the detector agent and return the trained model."""
+    """Train the detector agent and persist model + normaliser."""
+
     from environment.network_env import NetworkEnv
 
-    n_features_raw = X_train.shape[1]
-    window_size = 5
-
     def make_env():
-        env = NetworkEnv(X_train, y_train, max_steps=1000, window_size=window_size)
-        return Monitor(env)
+        return Monitor(NetworkEnv(X_train, y_train, max_steps=1_000, window_size=window_size))
 
-    vec_env = DummyVecEnv([make_env] * n_envs)
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    vec_env  = VecNormalize(DummyVecEnv([make_env] * n_envs), norm_obs=True, norm_reward=True, clip_obs=10.0)
+    eval_env = VecNormalize(
+        DummyVecEnv([lambda: Monitor(NetworkEnv(X_val, y_val, max_steps=500, window_size=window_size))]),
+        norm_obs=True, norm_reward=False, clip_obs=10.0,
+    )
 
-    eval_env = DummyVecEnv([lambda: Monitor(NetworkEnv(X_val, y_val, max_steps=500, window_size=window_size))])
-    eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
-
-    model = build_detector_agent(vec_env, n_features=n_features_raw, window_size=window_size)
+    model = build_detector(vec_env, n_features=X_train.shape[1], window_size=window_size)
 
     callbacks = [
-        ThreatDetectionCallback(eval_freq=5000, verbose=1),
+        DetectorMetricsCallback(eval_freq=5_000, verbose=1),
         EvalCallback(
             eval_env,
             best_model_save_path=save_path,
@@ -180,12 +179,19 @@ def train_detector(
         ),
     ]
 
-    log.info(f"Training detector agent for {total_timesteps:,} timesteps...")
+    log.info("Training detector for %s timesteps …", f"{total_timesteps:,}")
     model.learn(total_timesteps=total_timesteps, callback=callbacks, progress_bar=True)
 
-    Path(save_path).mkdir(parents=True, exist_ok=True)
-    model.save(f"{save_path}/final_model")
-    vec_env.save(f"{save_path}/vec_normalize.pkl")
-
-    log.info(f"Detector agent saved to {save_path}")
+    out = Path(save_path)
+    out.mkdir(parents=True, exist_ok=True)
+    model.save(out / "final_model")
+    vec_env.save(out / "vec_normalize.pkl")
+    log.info("Detector saved → %s", save_path)
     return model
+
+
+def load_detector(save_path: str = "models/detector") -> tuple[PPO, VecNormalize]:
+    """Load a saved detector model and its observation normaliser."""
+    model  = PPO.load(f"{save_path}/final_model")
+    vec_env = VecNormalize.load(f"{save_path}/vec_normalize.pkl", DummyVecEnv([lambda: None]))
+    return model, vec_env

@@ -2,46 +2,53 @@
 NetSentinel-RL — Classifier Agent
 Fine-tunes DistilBERT on flow-as-text representations with RL reward shaping.
 
-Novel approach: network flow statistics are converted to structured natural
-language tokens, enabling transfer learning from pre-trained LMs while adding
-an RL reward signal on top of standard cross-entropy loss.
+Network flow statistics are serialised to structured natural-language tokens,
+enabling pre-trained language-model transfer while an asymmetric RL reward
+signal steers training toward the operational F1 objective.
 """
 
 from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from transformers import (
-    AutoTokenizer,
     AutoModelForSequenceClassification,
-    TrainingArguments,
-    Trainer,
+    AutoTokenizer,
     EvalPrediction,
+    Trainer,
+    TrainingArguments,
 )
 import evaluate
-from pathlib import Path
-from typing import Optional
-import logging
 
 log = logging.getLogger(__name__)
 
-# Attack class names matching environment/network_env.py ATTACK_NAMES
 ATTACK_NAMES = [
     "Benign", "DoS", "DDoS", "PortScan",
-    "BruteForce", "Botnet", "WebAttack", "Infiltration"
+    "BruteForce", "Botnet", "WebAttack", "Infiltration",
 ]
+N_CLASSES = len(ATTACK_NAMES)
 
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
 
 class FlowTextDataset(Dataset):
-    """
-    Dataset of flow text representations with integer labels.
-    Uses FlowTextEncoder output from data/preprocess.py.
-    """
+    """Flow text representations paired with integer class labels."""
 
-    def __init__(self, texts: list[str], labels: np.ndarray, tokenizer, max_length: int = 128):
-        self.labels = torch.tensor(labels, dtype=torch.long)
-        log.info(f"Tokenising {len(texts):,} flow texts...")
+    def __init__(
+        self,
+        texts: list[str],
+        labels: np.ndarray,
+        tokenizer,
+        max_length: int = 128,
+    ) -> None:
+        self.labels    = torch.tensor(labels, dtype=torch.long)
+        log.info("Tokenising %s flows …", f"{len(texts):,}")
         self.encodings = tokenizer(
             texts,
             truncation=True,
@@ -50,10 +57,10 @@ class FlowTextDataset(Dataset):
             return_tensors="pt",
         )
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict:
         return {
             "input_ids":      self.encodings["input_ids"][idx],
             "attention_mask": self.encodings["attention_mask"][idx],
@@ -61,97 +68,79 @@ class FlowTextDataset(Dataset):
         }
 
 
-class RLRewardShapedTrainer(Trainer):
+# ── Custom trainer with RL reward shaping ─────────────────────────────────────
+
+class RewardShapedTrainer(Trainer):
     """
-    Custom HuggingFace Trainer that augments the cross-entropy loss
-    with an RL-inspired reward signal.
+    Hugging Face Trainer with an asymmetric RL-inspired loss term.
 
-    Reward shaping strategy:
-    - Standard cross-entropy provides the base gradient
-    - An additional penalty term is added when the model confidently
-      misclassifies attacks as benign (false negatives), mimicking
-      the FN_COST in the RL environment
-    - A smaller penalty for false positives (benign as attack)
+    Standard cross-entropy is augmented by:
+    - A false-negative penalty: the model is penalised when it assigns
+      high benign probability to actual attack flows.  The penalty weight
+      (FN_WEIGHT = 2.0) mirrors the FN_COST / TP_REWARD ratio in NetworkEnv.
+    - A smaller false-positive penalty for high attack probability on benign
+      flows, matching the FP_COST / TP_REWARD ratio (FP_WEIGHT = 0.8).
 
-    This bridges the gap between supervised learning objectives
-    (accuracy) and the operational metric we actually care about (F1
-    with asymmetric FP/FN costs).
+    This bridges the gap between the supervised cross-entropy objective and
+    the operational metric (weighted F1 with asymmetric costs).
     """
 
-    FN_PENALTY_WEIGHT = 2.0   # Matches NetworkEnv.FN_COST / TP_REWARD ratio
-    FP_PENALTY_WEIGHT = 0.8
+    FN_WEIGHT: float = 2.0
+    FP_WEIGHT: float = 0.8
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.get("labels")
+    def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
+        labels  = inputs["labels"]
         outputs = model(**inputs)
-        logits = outputs.logits
+        logits  = outputs.logits
 
-        # Standard cross-entropy
-        ce_loss = nn.CrossEntropyLoss()(logits, labels)
-
-        # RL reward shaping: compute penalty for high-confidence errors
-        probs = torch.softmax(logits, dim=-1)
-        benign_prob = probs[:, 0]
+        ce_loss  = nn.CrossEntropyLoss()(logits, labels)
+        probs    = torch.softmax(logits, dim=-1)
+        benign_p = probs[:, 0]
 
         is_attack = (labels != 0).float()
         is_benign = (labels == 0).float()
 
-        # FN penalty: model assigns high probability to benign for actual attacks
-        fn_penalty = (is_attack * benign_prob).mean()
+        fn_penalty = (is_attack * benign_p).mean()
+        fp_penalty = (is_benign * (1.0 - benign_p)).mean()
 
-        # FP penalty: model assigns low probability to benign for actual benign flows
-        fp_penalty = (is_benign * (1 - benign_prob)).mean()
+        loss = ce_loss + self.FN_WEIGHT * fn_penalty + self.FP_WEIGHT * fp_penalty
+        return (loss, outputs) if return_outputs else loss
 
-        total_loss = (
-            ce_loss
-            + self.FN_PENALTY_WEIGHT * fn_penalty
-            + self.FP_PENALTY_WEIGHT * fp_penalty
-        )
 
-        return (total_loss, outputs) if return_outputs else total_loss
-
+# ── Metrics ───────────────────────────────────────────────────────────────────
 
 def compute_metrics(pred: EvalPrediction) -> dict:
-    """Compute F1, precision, recall for HF Trainer evaluation."""
-    metric_f1 = evaluate.load("f1")
-    metric_acc = evaluate.load("accuracy")
+    f1_metric  = evaluate.load("f1")
+    acc_metric = evaluate.load("accuracy")
 
-    predictions = np.argmax(pred.predictions, axis=1)
+    preds  = np.argmax(pred.predictions, axis=1)
     labels = pred.label_ids
 
-    f1_result = metric_f1.compute(
-        predictions=predictions, references=labels, average="weighted"
-    )
-    acc_result = metric_acc.compute(predictions=predictions, references=labels)
-
-    # Per-class F1 for interpretability
-    per_class_f1 = metric_f1.compute(
-        predictions=predictions, references=labels, average=None
-    )
-
     results = {
-        "f1_weighted": f1_result["f1"],
-        "accuracy":    acc_result["accuracy"],
+        "f1_weighted": f1_metric.compute(predictions=preds, references=labels, average="weighted")["f1"],
+        "accuracy":    acc_metric.compute(predictions=preds, references=labels)["accuracy"],
     }
-    if per_class_f1 and "f1" in per_class_f1:
+
+    per_class = f1_metric.compute(predictions=preds, references=labels, average=None)
+    if per_class and "f1" in per_class:
         for i, name in enumerate(ATTACK_NAMES):
-            if i < len(per_class_f1["f1"]):
-                results[f"f1_{name}"] = round(float(per_class_f1["f1"][i]), 4)
+            if i < len(per_class["f1"]):
+                results[f"f1_{name}"] = round(float(per_class["f1"][i]), 4)
+
     return results
 
 
-def build_classifier(
-    model_name: str = "distilbert-base-uncased",
-    n_labels: int = 8,
-) -> tuple:
-    """Load tokeniser and model for sequence classification."""
-    log.info(f"Loading {model_name} for {n_labels}-class classification...")
+# ── Build / train / load ──────────────────────────────────────────────────────
+
+def build_classifier(model_name: str = "distilbert-base-uncased") -> tuple:
+    """Return (tokenizer, model) for fine-tuning."""
+    log.info("Loading %s for %d-class classification …", model_name, N_CLASSES)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSequenceClassification.from_pretrained(
+    model     = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        num_labels=n_labels,
-        id2label={i: name for i, name in enumerate(ATTACK_NAMES)},
-        label2id={name: i for i, name in enumerate(ATTACK_NAMES)},
+        num_labels=N_CLASSES,
+        id2label={i: n for i, n in enumerate(ATTACK_NAMES)},
+        label2id={n: i for i, n in enumerate(ATTACK_NAMES)},
     )
     return tokenizer, model
 
@@ -166,18 +155,15 @@ def train_classifier(
     num_epochs: int = 5,
     batch_size: int = 32,
     learning_rate: float = 2e-5,
-    use_rl_shaping: bool = True,
+    use_reward_shaping: bool = True,
 ) -> tuple:
-    """
-    Fine-tune DistilBERT on flow text data with optional RL reward shaping.
-    Returns (trainer, tokenizer, model).
-    """
-    tokenizer, model = build_classifier(model_name, n_labels=len(ATTACK_NAMES))
+    """Fine-tune DistilBERT; returns (trainer, tokenizer, model)."""
 
-    train_dataset = FlowTextDataset(texts_train, y_train, tokenizer)
-    val_dataset   = FlowTextDataset(texts_val,   y_val,   tokenizer)
+    tokenizer, model = build_classifier(model_name)
+    train_ds = FlowTextDataset(texts_train, y_train, tokenizer)
+    val_ds   = FlowTextDataset(texts_val,   y_val,   tokenizer)
 
-    training_args = TrainingArguments(
+    args = TrainingArguments(
         output_dir=save_path,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
@@ -185,7 +171,7 @@ def train_classifier(
         learning_rate=learning_rate,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="f1_weighted",
@@ -196,57 +182,53 @@ def train_classifier(
         dataloader_num_workers=2,
     )
 
-    TrainerClass = RLRewardShapedTrainer if use_rl_shaping else Trainer
-    trainer = TrainerClass(
+    TrainerCls = RewardShapedTrainer if use_reward_shaping else Trainer
+    trainer    = TrainerCls(
         model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        args=args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
     )
 
-    log.info(f"Training classifier ({'RL-shaped' if use_rl_shaping else 'standard'})...")
+    label = "reward-shaped" if use_reward_shaping else "standard"
+    log.info("Training classifier (%s) …", label)
     trainer.train()
 
     metrics = trainer.evaluate()
-    log.info(f"Final val metrics: {metrics}")
+    log.info("Validation metrics: %s", metrics)
 
     trainer.save_model(save_path)
     tokenizer.save_pretrained(save_path)
-    log.info(f"Classifier saved to {save_path}")
-
+    log.info("Classifier saved → %s", save_path)
     return trainer, tokenizer, model
 
 
-def load_classifier(save_path: str = "models/classifier"):
-    """Load a saved classifier for inference."""
+def load_classifier(save_path: str = "models/classifier") -> tuple:
     tokenizer = AutoTokenizer.from_pretrained(save_path)
-    model = AutoModelForSequenceClassification.from_pretrained(save_path)
+    model     = AutoModelForSequenceClassification.from_pretrained(save_path)
     model.eval()
     return tokenizer, model
 
 
-def predict_threat_class(
+def predict(
     flow_text: str,
     tokenizer,
     model,
     return_probs: bool = False,
 ) -> dict:
-    """Run inference on a single flow text representation."""
-    inputs = tokenizer(
-        flow_text, return_tensors="pt", truncation=True, max_length=128
-    )
+    """Run inference on a single serialised flow string."""
+    inputs = tokenizer(flow_text, return_tensors="pt", truncation=True, max_length=128)
     with torch.no_grad():
-        outputs = model(**inputs)
-    probs = torch.softmax(outputs.logits, dim=-1).squeeze().numpy()
+        logits = model(**inputs).logits
+    probs      = torch.softmax(logits, dim=-1).squeeze().numpy()
     pred_class = int(np.argmax(probs))
-
     result = {
         "predicted_class": pred_class,
         "predicted_label": ATTACK_NAMES[pred_class],
-        "confidence": float(probs[pred_class]),
+        "confidence":      float(probs[pred_class]),
     }
     if return_probs:
-        result["class_probs"] = {name: float(p) for name, p in zip(ATTACK_NAMES, probs)}
+        result["class_probs"] = {n: float(p) for n, p in zip(ATTACK_NAMES, probs)}
     return result

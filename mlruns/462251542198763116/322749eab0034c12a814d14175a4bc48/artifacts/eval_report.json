@@ -1,0 +1,32 @@
+{
+  "n_samples": 100,
+  "accuracy": 0.93,
+  "f1_weighted": 0.9451,
+  "precision": 0.8958,
+  "recall": 1.0,
+  "false_positive_rate": 0.0877,
+  "false_negative_rate": 0.0,
+  "mean_confidence": 0.8496,
+  "mean_latency_ms": 57.94,
+  "p50_latency_ms": 50.2,
+  "p95_latency_ms": 145.49,
+  "p99_latency_ms": 258.0,
+  "shap_grounded_rate": 1.0,
+  "hallucination_rate": 0.0,
+  "mean_bert_score": 0.8333,
+  "per_class_f1": {
+    "Benign": 0.9541,
+    "DoS": 0.9474,
+    "DDoS": 1.0,
+    "PortScan": 0.8,
+    "BruteForce": 0.9302,
+    "Botnet": 0.0,
+    "WebAttack": 0.0,
+    "Infiltration": 0.0
+  },
+  "action_distribution": {
+    "no_action": 57,
+    "block_ip": 43
+  },
+  "timestamp": 1777063803.000832
+}

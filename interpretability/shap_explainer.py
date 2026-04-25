@@ -1,242 +1,208 @@
 """
-NetSentinel-RL — Interpretability Layer
-SHAP explanations, attention visualisation, and NL verdict generation.
+NetSentinel-RL — SHAP Explainability Module
+Computes SHAP values for tree-based models and exports summary artefacts.
 """
 
 from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
-import logging
 
 log = logging.getLogger(__name__)
+
+try:
+    import shap
+    _SHAP_AVAILABLE = True
+except ImportError:
+    _SHAP_AVAILABLE = False
+    log.warning("shap not installed — explainability features disabled.")
+
+
+FEATURE_NAMES: List[str] = [
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Total Length of Fwd Packets",
+    "Fwd Packet Length Max",
+    "Fwd Packet Length Mean",
+    "Bwd Packet Length Max",
+    "Flow Bytes/s",
+    "Flow Packets/s",
+    "Flow IAT Mean",
+    "Flow IAT Std",
+    "Fwd IAT Mean",
+    "Bwd IAT Mean",
+    "Fwd PSH Flags",
+    "Bwd PSH Flags",
+    "Fwd URG Flags",
+    "SYN Flag Count",
+    "RST Flag Count",
+    "ACK Flag Count",
+    "Down/Up Ratio",
+    "Avg Packet Size",
+]
 
 
 class SHAPExplainer:
     """
-    Wraps SHAP to explain RL agent decisions and classifier predictions.
-    Supports both tree-based and deep model explanations.
+    Wraps shap.TreeExplainer (or KernelExplainer as fallback) for the
+    NetSentinel classifier models.
+
+    Usage
+    -----
+    explainer = SHAPExplainer(model)
+    values = explainer.explain(X_sample)
+    top = explainer.top_features(X_sample[0])
     """
 
     def __init__(
         self,
         model,
-        X_background: np.ndarray,
-        feature_names: List[str],
-        model_type: str = "deep",   # "deep" | "kernel" | "tree"
+        feature_names: Optional[List[str]] = None,
+        background_data: Optional[np.ndarray] = None,
         n_background: int = 100,
-    ):
-        self.model = model
-        self.feature_names = feature_names
-        self.model_type = model_type
-        self._explainer = None
+    ) -> None:
+        if not _SHAP_AVAILABLE:
+            raise ImportError("Install shap: pip install shap")
 
-        # Use a subsample as background for efficiency
-        idx = np.random.choice(len(X_background), min(n_background, len(X_background)), replace=False)
-        self.background = X_background[idx]
+        self.model         = model
+        self.feature_names = feature_names or FEATURE_NAMES
 
-    def _build_explainer(self):
-        """Lazily build the SHAP explainer."""
-        import shap
-        if self.model_type == "kernel":
-            self._explainer = shap.KernelExplainer(
-                self.model.predict_proba
-                if hasattr(self.model, "predict_proba")
-                else self.model.predict,
-                self.background,
-            )
-        elif self.model_type == "deep" and hasattr(self.model, "policy"):
-            # For SB3 PPO: explain the policy's value function
-            import torch
+        try:
+            self._explainer = shap.TreeExplainer(model)
+            log.info("Using TreeExplainer.")
+        except Exception:
+            if background_data is None:
+                raise ValueError("background_data required for KernelExplainer.")
+            bg = shap.sample(background_data, n_background)
+            self._explainer = shap.KernelExplainer(model.predict_proba, bg)
+            log.info("Using KernelExplainer (slower).")
 
-            def predict_fn(x):
-                tensor = torch.FloatTensor(x)
-                with torch.no_grad():
-                    _, value, _ = self.model.policy.evaluate_actions(
-                        tensor, torch.zeros(len(x), dtype=torch.long)
-                    )
-                return value.numpy()
+    def explain(self, X: np.ndarray, check_additivity: bool = False) -> np.ndarray:
+        """
+        Return raw SHAP values array.
 
-            self._explainer = shap.KernelExplainer(predict_fn, self.background[:20])
+        Shape for binary classification: (n_samples, n_features)
+        Shape for multiclass:            (n_classes, n_samples, n_features)
+        """
+        values = self._explainer.shap_values(X, check_additivity=check_additivity)
+        # For multiclass TreeExplainer returns a list; stack to 3-D array
+        if isinstance(values, list):
+            return np.stack(values, axis=0)
+        return values
+
+    def top_features(
+        self, x: np.ndarray, n: int = 5, class_idx: int = 1
+    ) -> Dict[str, float]:
+        """
+        Return the top-n most important features for a single flow vector.
+
+        Parameters
+        ----------
+        x         : 1-D feature vector.
+        n         : Number of top features to return.
+        class_idx : Which class to explain for multiclass models.
+        """
+        values = self.explain(x.reshape(1, -1))
+
+        if values.ndim == 3:
+            row = values[class_idx, 0, :]
         else:
-            import shap
-            self._explainer = shap.KernelExplainer(
-                lambda x: np.random.rand(len(x), 2),  # fallback
-                self.background[:20],
-            )
+            row = values[0, :]
 
-    def explain_single(self, x: np.ndarray) -> Dict[str, float]:
+        order = np.argsort(np.abs(row))[::-1][:n]
+        return {
+            self.feature_names[i]: float(row[i])
+            for i in order
+            if i < len(self.feature_names)
+        }
+
+    def mean_importance(
+        self, X: np.ndarray, class_idx: int = 1
+    ) -> pd.Series:
         """
-        Explain a single flow observation.
-        Returns dict of feature_name -> shap_value.
+        Compute mean absolute SHAP importance across a sample set.
+
+        Returns a pd.Series sorted descending, indexed by feature name.
         """
-        import shap
-        if self._explainer is None:
-            self._build_explainer()
+        values = self.explain(X)
+        if values.ndim == 3:
+            mat = np.abs(values[class_idx])
+        else:
+            mat = np.abs(values)
 
-        x_2d = x.reshape(1, -1)
-        shap_vals = self._explainer.shap_values(x_2d, silent=True)
-
-        if isinstance(shap_vals, list):
-            shap_vals = shap_vals[1]  # Take attack class for binary
-
-        vals = shap_vals.flatten()
-        n = min(len(vals), len(self.feature_names))
-        return {self.feature_names[i]: float(vals[i]) for i in range(n)}
-
-    def explain_batch(
-        self, X: np.ndarray, top_k: int = 10
-    ) -> List[Dict[str, float]]:
-        """Explain a batch of flows, returning top-k features per flow."""
-        import shap
-        if self._explainer is None:
-            self._build_explainer()
-
-        shap_vals = self._explainer.shap_values(X, silent=True)
-        if isinstance(shap_vals, list):
-            shap_vals = shap_vals[1]
-
-        results = []
-        for i in range(len(X)):
-            vals = shap_vals[i].flatten()
-            n = min(len(vals), len(self.feature_names))
-            feat_importance = {
-                self.feature_names[j]: float(vals[j]) for j in range(n)
-            }
-            # Return top-k by absolute value
-            top = dict(
-                sorted(feat_importance.items(), key=lambda x: abs(x[1]), reverse=True)[:top_k]
-            )
-            results.append(top)
-        return results
-
-    def summary_plot_data(self, X: np.ndarray) -> Dict:
-        """Return data needed for a SHAP summary plot."""
-        import shap
-        if self._explainer is None:
-            self._build_explainer()
-        shap_vals = self._explainer.shap_values(X[:200], silent=True)
-        if isinstance(shap_vals, list):
-            shap_vals = shap_vals[1]
-        mean_abs = np.abs(shap_vals).mean(axis=0)
-        n = min(len(mean_abs), len(self.feature_names))
-        importance = {self.feature_names[i]: float(mean_abs[i]) for i in range(n)}
-        return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
-
-
-class NLVerdictGenerator:
-    """
-    Generates natural language explanations for agent decisions.
-    Uses SHAP values as the factual grounding to ensure faithfulness.
-
-    Example output:
-      "Blocked 192.168.1.5: Flow showed SYN flag density of 0.94 (3.2σ above baseline)
-       with 847 packets/s — consistent with SYN flood pattern. SHAP analysis identified
-       SYN_Flag_Count (importance: 0.82) and Flow_Packets/s (0.71) as primary indicators."
-    """
-
-    SEVERITY_THRESHOLDS = {
-        "critical": 0.90,
-        "high":     0.70,
-        "medium":   0.45,
-        "low":      0.0,
-    }
-
-    ATTACK_DESCRIPTIONS = {
-        "DoS":        "volumetric denial-of-service attack",
-        "DDoS":       "distributed denial-of-service attack",
-        "PortScan":   "network reconnaissance / port scan",
-        "BruteForce": "credential brute-force attack",
-        "Botnet":     "botnet command-and-control traffic",
-        "WebAttack":  "web application attack",
-        "Infiltration": "data exfiltration attempt",
-        "Benign":     "normal traffic",
-    }
-
-    def generate_verdict(
-        self,
-        predicted_class: str,
-        confidence: float,
-        shap_features: Dict[str, float],
-        flow_stats: Dict,
-        action_taken: str,
-        source_ip: Optional[str] = None,
-    ) -> str:
-        """Generate a concise, SHAP-grounded natural language verdict."""
-
-        severity = self._get_severity(confidence)
-        attack_desc = self.ATTACK_DESCRIPTIONS.get(predicted_class, predicted_class)
-        top_2_features = list(shap_features.items())[:2]
-
-        src = f"from {source_ip}" if source_ip else "detected"
-        action_phrase = {
-            "block_ip":     "Blocked",
-            "rate_limit":   "Rate-limited",
-            "deep_inspect": "Flagged for deep inspection",
-            "alert_soc":    "SOC alert raised for",
-            "no_action":    "Monitoring",
-        }.get(action_taken, "Actioned")
-
-        # Build feature citation
-        feature_citations = []
-        for feat, importance in top_2_features:
-            feat_readable = feat.replace("_", " ").lower()
-            feature_citations.append(f"{feat_readable} (SHAP: {importance:+.3f})")
-
-        feat_str = " and ".join(feature_citations) if feature_citations else "flow anomalies"
-
-        explanation = (
-            f"{action_phrase} {src}: {severity.upper()} confidence {attack_desc} "
-            f"(confidence: {confidence:.1%}). "
-            f"Primary indicators: {feat_str}. "
+        means = mat.mean(axis=0)
+        n     = min(len(means), len(self.feature_names))
+        return (
+            pd.Series(means[:n], index=self.feature_names[:n])
+            .sort_values(ascending=False)
         )
 
-        # Add specific flow stat if available
-        if "Flow Packets/s" in flow_stats:
-            pps = flow_stats["Flow Packets/s"]
-            explanation += f"Flow rate: {pps:.0f} packets/s."
-        elif "SYN Flag Count" in flow_stats and flow_stats["SYN Flag Count"] > 0:
-            explanation += f"Anomalous SYN flag pattern detected."
-
-        return explanation
-
-    def _get_severity(self, confidence: float) -> str:
-        for severity, threshold in self.SEVERITY_THRESHOLDS.items():
-            if confidence >= threshold:
-                return severity
-        return "low"
-
-    def generate_batch_report(
+    def summary_plot(
         self,
-        verdicts: List[Dict],
-        window_minutes: int = 5,
-    ) -> str:
-        """Generate a summary report for a batch of flow verdicts."""
-        threats = [v for v in verdicts if v.get("threat_detected")]
-        benign  = [v for v in verdicts if not v.get("threat_detected")]
-        threat_types: Dict[str, int] = {}
-        for v in threats:
-            t = v.get("threat_type", "Unknown")
-            threat_types[t] = threat_types.get(t, 0) + 1
+        X: np.ndarray,
+        out_path: Optional[str] = None,
+        plot_type: str = "bar",
+        class_idx: int = 1,
+    ) -> None:
+        """
+        Render and optionally save a SHAP summary plot.
 
-        report_lines = [
-            f"=== NetSentinel-RL Report ({window_minutes}-minute window) ===",
-            f"Total flows analysed: {len(verdicts)}",
-            f"Threats detected: {len(threats)} ({len(threats)/max(1,len(verdicts)):.1%})",
-            f"Benign traffic: {len(benign)}",
-            "",
-            "Threat breakdown:",
-        ]
-        for ttype, count in sorted(threat_types.items(), key=lambda x: x[1], reverse=True):
-            report_lines.append(f"  {ttype}: {count}")
+        Parameters
+        ----------
+        X         : Feature matrix to explain.
+        out_path  : If given, saves the figure to this path (PNG).
+        plot_type : "bar" | "dot" | "violin"
+        class_idx : Class index for multiclass models.
+        """
+        import matplotlib.pyplot as plt
 
-        if threats:
-            max_severity = max(threats, key=lambda v: v.get("confidence_score", 0))
-            report_lines += [
-                "",
-                f"Highest confidence threat: {max_severity.get('threat_type')} "
-                f"({max_severity.get('confidence_score', 0):.1%})",
-                f"Action taken: {max_severity.get('recommended_action')}",
-            ]
+        values = self.explain(X)
+        if isinstance(values, np.ndarray) and values.ndim == 3:
+            shap_vals = values[class_idx]
+        else:
+            shap_vals = values
 
-        return "\n".join(report_lines)
+        shap.summary_plot(
+            shap_vals,
+            X,
+            feature_names=self.feature_names[: X.shape[1]],
+            plot_type=plot_type,
+            show=out_path is None,
+        )
+
+        if out_path:
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            log.info("SHAP summary saved → %s", out_path)
+
+    def dependence_plot(
+        self,
+        feature: str,
+        X: np.ndarray,
+        out_path: Optional[str] = None,
+        class_idx: int = 1,
+    ) -> None:
+        """Plot SHAP dependence for a single feature."""
+        import matplotlib.pyplot as plt
+
+        values = self.explain(X)
+        shap_vals = values[class_idx] if values.ndim == 3 else values
+
+        shap.dependence_plot(
+            feature,
+            shap_vals,
+            X,
+            feature_names=self.feature_names[: X.shape[1]],
+            show=out_path is None,
+        )
+
+        if out_path:
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close()

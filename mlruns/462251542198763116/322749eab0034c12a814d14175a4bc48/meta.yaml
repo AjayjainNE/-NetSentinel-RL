@@ -1,0 +1,14 @@
+artifact_uri: /Users/ajayanilkhadke/Downloads/-NetSentinel-RL/notebooks/../mlruns/462251542198763116/322749eab0034c12a814d14175a4bc48/artifacts
+end_time: 1777063803087
+entry_point_name: ''
+experiment_id: '462251542198763116'
+lifecycle_stage: active
+run_id: 322749eab0034c12a814d14175a4bc48
+run_name: baseline_eval
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1777063803073
+status: 3
+tags: []
+user_id: ajayanilkhadke

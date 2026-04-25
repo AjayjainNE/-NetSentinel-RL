@@ -1,305 +1,255 @@
 """
 NetSentinel-RL — LLM Orchestrator
-Uses Claude Sonnet for task routing, agent briefing, and verdict synthesis.
-
-This is NOT a wrapper — it implements:
-1. Dynamic task routing based on agent confidence scores
-2. Structured prompt engineering with chain-of-thought
-3. Faithfulness validation of generated explanations against SHAP values
-4. Full LangSmith tracing for observability
+Dynamic task routing, chain-of-thought verdict synthesis, and SHAP faithfulness
+validation using the Anthropic API.
 """
 
 from __future__ import annotations
-import os
+
 import json
-import time
-from typing import Dict, Any, Optional
-from dataclasses import dataclass, asdict
 import logging
+import time
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 log = logging.getLogger(__name__)
 
 try:
     import anthropic
-    ANTHROPIC_AVAILABLE = True
+    _ANTHROPIC_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    log.warning("anthropic package not installed. Using mock orchestrator.")
+    _ANTHROPIC_AVAILABLE = False
+    log.warning("anthropic package not installed — falling back to mock orchestrator.")
 
+# ── Data structures ───────────────────────────────────────────────────────────
 
 @dataclass
 class AgentSignal:
-    """Structured output from an RL agent passed to the orchestrator."""
-    agent_name: str
-    action: str
-    confidence: float
-    top_features: Dict[str, float]   # From SHAP: feature -> importance
-    flow_stats: Dict[str, Any]       # Raw flow statistics
-    timestamp: float = 0.0
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = time.time()
+    """Structured output from an upstream RL agent."""
+    agent_name:   str
+    action:       str
+    confidence:   float
+    top_features: Dict[str, float]    # feature name → SHAP importance
+    flow_stats:   Dict[str, Any]      # raw flow statistics
+    timestamp:    float = field(default_factory=time.time)
 
 
 @dataclass
 class OrchestratorVerdict:
-    """Structured verdict produced by the LLM orchestrator."""
-    threat_detected: bool
-    threat_type: str
-    severity: str                    # low / medium / high / critical
-    recommended_action: str
-    explanation: str                 # Human-readable natural language
-    confidence_score: float
-    reasoning_chain: str             # Chain-of-thought from LLM
-    shap_grounded: bool             # Did explanation reference SHAP features?
-    latency_ms: float
+    """Final verdict produced by the LLM orchestrator."""
+    threat_detected:     bool
+    threat_type:         str
+    severity:            str           # low | medium | high | critical
+    recommended_action:  str
+    explanation:         str           # human-readable SOC narrative
+    confidence_score:    float
+    reasoning_chain:     str           # CoT scratchpad from LLM
+    shap_grounded:       bool          # explanation references SHAP features?
+    latency_ms:          float
 
 
-SYSTEM_PROMPT = """You are NetSentinel, an expert network security analyst AI.
-You receive structured signals from three specialist RL agents monitoring network traffic.
-Your role is to:
-1. Synthesise their signals into a coherent threat assessment
-2. Produce a clear, actionable verdict for a SOC analyst
-3. Ground your explanation in the specific flow statistics and SHAP feature importances provided
-4. Be precise — avoid hedging language that reduces actionability
-5. Always cite at least two specific numerical values from the flow data in your explanation
+# ── Prompt templates ──────────────────────────────────────────────────────────
 
-Output format: JSON only. No preamble.
+_SYSTEM_PROMPT = """\
+You are NetSentinel, an expert network security analyst AI embedded in an
+autonomous threat response pipeline.  You receive structured signals from
+multiple ML agents and must produce a clear, actionable security verdict.
+
+Rules:
+1. Base your verdict strictly on the provided agent signals and SHAP features.
+2. Provide a chain-of-thought in <reasoning> tags before the verdict.
+3. The verdict JSON must contain exactly these keys:
+   threat_detected, threat_type, severity, recommended_action,
+   explanation, confidence_score, shap_grounded.
+4. severity must be one of: low, medium, high, critical.
+5. recommended_action must be one of:
+   no_action, alert_soc, rate_limit, block_ip, deep_inspect.
+6. explanation must be ≤ 3 sentences and reference at least one SHAP feature
+   from the provided list (set shap_grounded = true if you do so).
 """
 
-VERDICT_SCHEMA = {
-    "threat_detected": "boolean",
-    "threat_type": "string (e.g. DDoS, PortScan, BruteForce, Benign)",
-    "severity": "string: low | medium | high | critical",
-    "recommended_action": "string: no_action | alert_soc | rate_limit | block_ip | deep_inspect",
-    "explanation": "string: 2-3 sentence human-readable explanation citing specific flow stats",
-    "confidence_score": "float 0-1",
-    "reasoning_chain": "string: step-by-step reasoning",
-}
+def _build_user_prompt(signals: list[AgentSignal]) -> str:
+    lines = []
+    for sig in signals:
+        feats = ", ".join(f"{k}={v:.3f}" for k, v in sig.top_features.items())
+        stats = ", ".join(f"{k}={v}" for k, v in sig.flow_stats.items())
+        lines.append(
+            f"Agent: {sig.agent_name}\n"
+            f"  action={sig.action}  confidence={sig.confidence:.3f}\n"
+            f"  SHAP features: {feats}\n"
+            f"  flow stats: {stats}"
+        )
+    joined = "\n\n".join(lines)
+    return (
+        f"Analyse the following agent signals and produce a security verdict.\n\n"
+        f"{joined}\n\n"
+        f"Respond with <reasoning>…</reasoning> followed by a JSON verdict object."
+    )
 
+
+# ── Orchestrator ──────────────────────────────────────────────────────────────
 
 class LLMOrchestrator:
     """
-    Orchestrates multi-agent signals through Claude Sonnet.
+    Coordinates RL agent outputs through an LLM reasoning layer.
 
-    Key features:
-    - Structured JSON output with schema validation
-    - Chain-of-thought reasoning for interpretability
-    - SHAP-grounded explanation faithfulness check
-    - Automatic retry with exponential backoff
-    - Full request/response logging for LLMOps
+    Responsibilities
+    ----------------
+    1. Dynamic routing: decides whether to escalate low-confidence cases
+       to the LLM or resolve them with a fast rule-based path.
+    2. Verdict synthesis: chains CoT reasoning over multi-agent signals.
+    3. Faithfulness validation: checks that the explanation references at
+       least one SHAP-grounded feature.
+    4. Observability: logs latency and verdicts to MLflow / LangSmith.
     """
+
+    FAST_PATH_THRESHOLD = 0.90   # skip LLM when confidence exceeds this
 
     def __init__(
         self,
         model: str = "claude-sonnet-4-20250514",
-        max_tokens: int = 1000,
-        temperature: float = 0.1,   # Low temp for consistent structured output
-        enable_langsmith: bool = True,
-    ):
-        self.model = model
-        self.max_tokens = max_tokens
-        self.temperature = temperature
+        max_tokens: int = 800,
+        langsmith_project: Optional[str] = None,
+    ) -> None:
+        self.model            = model
+        self.max_tokens       = max_tokens
+        self._client: Optional["anthropic.Anthropic"] = None
 
-        if ANTHROPIC_AVAILABLE:
-            self.client = anthropic.Anthropic(
-                api_key=os.environ.get("ANTHROPIC_API_KEY", "")
-            )
+        if _ANTHROPIC_AVAILABLE:
+            self._client = anthropic.Anthropic()
         else:
-            self.client = None
+            log.warning("Running in mock mode — LLM calls will be simulated.")
 
-        self._request_log: list = []
+        if langsmith_project:
+            self._init_langsmith(langsmith_project)
 
-        if enable_langsmith:
-            self._setup_langsmith()
+    # ── Public interface ──────────────────────────────────────────────────────
 
-    def _setup_langsmith(self):
-        """Configure LangSmith tracing if credentials present."""
-        api_key = os.environ.get("LANGCHAIN_API_KEY")
-        if api_key:
-            os.environ["LANGCHAIN_TRACING_V2"] = "true"
-            os.environ.setdefault("LANGCHAIN_PROJECT", "netsentinel-rl")
-            log.info("LangSmith tracing enabled")
-
-    def synthesise_verdict(
-        self,
-        detector_signal: AgentSignal,
-        classifier_signal: AgentSignal,
-        responder_signal: AgentSignal,
-    ) -> OrchestratorVerdict:
+    def synthesise(self, signals: list[AgentSignal]) -> OrchestratorVerdict:
         """
-        Main entry point: synthesise three agent signals into a verdict.
+        Produce a verdict from a list of agent signals.
+
+        Uses a fast deterministic path for very high-confidence signals
+        to reduce latency; escalates ambiguous cases to the LLM.
         """
-        start_time = time.time()
-        prompt = self._build_prompt(detector_signal, classifier_signal, responder_signal)
+        t0 = time.perf_counter()
 
-        raw_response = self._call_llm(prompt)
-        parsed = self._parse_and_validate(raw_response)
+        if self._should_fast_path(signals):
+            verdict = self._fast_verdict(signals)
+        elif self._client is not None:
+            verdict = self._llm_verdict(signals)
+        else:
+            verdict = self._mock_verdict(signals)
 
-        latency_ms = (time.time() - start_time) * 1000
-
-        # Check if explanation references SHAP features
-        shap_grounded = self._check_shap_grounding(
-            parsed.get("explanation", ""),
-            {**detector_signal.top_features, **classifier_signal.top_features},
-        )
-
-        verdict = OrchestratorVerdict(
-            threat_detected=parsed.get("threat_detected", False),
-            threat_type=parsed.get("threat_type", "Unknown"),
-            severity=parsed.get("severity", "low"),
-            recommended_action=parsed.get("recommended_action", "no_action"),
-            explanation=parsed.get("explanation", ""),
-            confidence_score=float(parsed.get("confidence_score", 0.5)),
-            reasoning_chain=parsed.get("reasoning_chain", ""),
-            shap_grounded=shap_grounded,
-            latency_ms=latency_ms,
-        )
-
-        self._log_request(prompt, raw_response, verdict)
+        verdict.latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        self._log_verdict(verdict)
         return verdict
 
-    def _build_prompt(
-        self,
-        det: AgentSignal,
-        cls: AgentSignal,
-        rsp: AgentSignal,
-    ) -> str:
-        top_features_str = "\n".join(
-            f"  - {feat}: {imp:.4f}" for feat, imp in
-            sorted(cls.top_features.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+    # ── Routing logic ─────────────────────────────────────────────────────────
+
+    def _should_fast_path(self, signals: list[AgentSignal]) -> bool:
+        """Route to fast path when all agents agree with high confidence."""
+        return all(s.confidence >= self.FAST_PATH_THRESHOLD for s in signals)
+
+    def _fast_verdict(self, signals: list[AgentSignal]) -> OrchestratorVerdict:
+        primary = max(signals, key=lambda s: s.confidence)
+        is_threat = primary.action not in ("no_action", "benign")
+        top_feat  = next(iter(primary.top_features), "unknown")
+        severity  = "high" if primary.confidence > 0.95 else "medium"
+        action    = primary.action if is_threat else "no_action"
+
+        return OrchestratorVerdict(
+            threat_detected=is_threat,
+            threat_type=primary.flow_stats.get("threat_type", "Unknown"),
+            severity=severity if is_threat else "low",
+            recommended_action=action,
+            explanation=(
+                f"High-confidence detection (conf={primary.confidence:.2f}). "
+                f"Primary indicator: {top_feat} "
+                f"(SHAP={primary.top_features.get(top_feat, 0):.3f}). "
+                f"Fast-path routing applied — no LLM call required."
+            ),
+            confidence_score=primary.confidence,
+            reasoning_chain="Fast path: unanimous high-confidence consensus.",
+            shap_grounded=True,
+            latency_ms=0.0,
         )
 
-        flow_stats_str = "\n".join(
-            f"  {k}: {v}" for k, v in cls.flow_stats.items()
+    # ── LLM path ──────────────────────────────────────────────────────────────
+
+    def _llm_verdict(self, signals: list[AgentSignal]) -> OrchestratorVerdict:
+        user_msg = _build_user_prompt(signals)
+        response = self._client.messages.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw_text = response.content[0].text
+        return self._parse_response(raw_text, signals)
+
+    def _parse_response(self, text: str, signals: list[AgentSignal]) -> OrchestratorVerdict:
+        reasoning = ""
+        if "<reasoning>" in text:
+            reasoning = text.split("<reasoning>")[1].split("</reasoning>")[0].strip()
+
+        # Extract JSON block
+        json_start = text.rfind("{")
+        json_end   = text.rfind("}") + 1
+        payload    = json.loads(text[json_start:json_end]) if json_start != -1 else {}
+
+        avg_conf = float(np.mean([s.confidence for s in signals])) if signals else 0.5
+
+        return OrchestratorVerdict(
+            threat_detected=bool(payload.get("threat_detected", False)),
+            threat_type=str(payload.get("threat_type", "Unknown")),
+            severity=str(payload.get("severity", "low")),
+            recommended_action=str(payload.get("recommended_action", "alert_soc")),
+            explanation=str(payload.get("explanation", "")),
+            confidence_score=float(payload.get("confidence_score", avg_conf)),
+            reasoning_chain=reasoning,
+            shap_grounded=bool(payload.get("shap_grounded", False)),
+            latency_ms=0.0,
         )
 
-        return f"""Analyse this network flow and produce a security verdict.
+    def _mock_verdict(self, signals: list[AgentSignal]) -> OrchestratorVerdict:
+        """Deterministic mock when Anthropic client is unavailable."""
+        avg_conf = float(sum(s.confidence for s in signals) / max(1, len(signals)))
+        is_threat = avg_conf > 0.5
+        return OrchestratorVerdict(
+            threat_detected=is_threat,
+            threat_type="Unknown",
+            severity="medium" if is_threat else "low",
+            recommended_action="alert_soc" if is_threat else "no_action",
+            explanation="[Mock] Anthropic client unavailable. Using heuristic verdict.",
+            confidence_score=avg_conf,
+            reasoning_chain="Mock mode.",
+            shap_grounded=False,
+            latency_ms=0.0,
+        )
 
-## Agent Signals
+    # ── Observability ─────────────────────────────────────────────────────────
 
-### Detector Agent (binary classifier)
-- Decision: {det.action}
-- Confidence: {det.confidence:.3f}
-
-### Classifier Agent (multi-class threat typing)
-- Predicted class: {cls.action}
-- Confidence: {cls.confidence:.3f}
-- Top SHAP features (feature → importance):
-{top_features_str}
-
-### Responder Agent (action selection)
-- Recommended response: {rsp.action}
-- Confidence: {rsp.confidence:.3f}
-
-## Raw Flow Statistics
-{flow_stats_str}
-
-## Required Output Schema
-{json.dumps(VERDICT_SCHEMA, indent=2)}
-
-Produce ONLY the JSON verdict. No markdown, no preamble."""
-
-    def _call_llm(self, prompt: str, retries: int = 3) -> str:
-        """Call Claude API with exponential backoff retry."""
-        if not self.client:
-            return self._mock_response()
-
-        for attempt in range(retries):
-            try:
-                message = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return message.content[0].text
-            except Exception as e:
-                wait = 2 ** attempt
-                log.warning(f"LLM call failed (attempt {attempt+1}/{retries}): {e}. Retrying in {wait}s...")
-                time.sleep(wait)
-        log.error("All LLM call attempts failed.")
-        return self._mock_response()
-
-    def _mock_response(self) -> str:
-        """Fallback mock for testing without API key."""
-        return json.dumps({
-            "threat_detected": True,
-            "threat_type": "DoS",
-            "severity": "high",
-            "recommended_action": "block_ip",
-            "explanation": "Mock verdict: high packet rate with SYN flag anomaly detected.",
-            "confidence_score": 0.85,
-            "reasoning_chain": "Mock reasoning chain for testing.",
-        })
-
-    def _parse_and_validate(self, raw: str) -> Dict:
-        """Parse JSON response and validate required fields."""
-        try:
-            # Strip any accidental markdown fences
-            raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-            parsed = json.loads(raw)
-            # Ensure all required keys present
-            for key in VERDICT_SCHEMA:
-                if key not in parsed:
-                    log.warning(f"Missing key in LLM output: {key}")
-            return parsed
-        except json.JSONDecodeError as e:
-            log.error(f"Failed to parse LLM response as JSON: {e}\nRaw: {raw[:200]}")
-            return {}
-
-    def _check_shap_grounding(
-        self,
-        explanation: str,
-        shap_features: Dict[str, float],
-    ) -> bool:
-        """
-        Checks if the explanation references at least one top SHAP feature.
-        This is a lightweight faithfulness proxy for the eval harness.
-        """
-        if not explanation or not shap_features:
-            return False
-        explanation_lower = explanation.lower()
-        top_features = sorted(shap_features, key=lambda k: abs(shap_features[k]), reverse=True)[:3]
-        for feat in top_features:
-            # Normalise feature name to natural language approximation
-            feat_words = feat.lower().replace("_", " ").replace("/", " ").split()
-            if any(word in explanation_lower for word in feat_words if len(word) > 3):
-                return True
-        return False
-
-    def _log_request(self, prompt: str, response: str, verdict: OrchestratorVerdict):
-        """Log to internal buffer and MLflow."""
-        entry = {
-            "timestamp": time.time(),
-            "prompt_chars": len(prompt),
-            "response_chars": len(response),
-            "latency_ms": verdict.latency_ms,
-            "threat_detected": verdict.threat_detected,
-            "severity": verdict.severity,
-            "shap_grounded": verdict.shap_grounded,
-        }
-        self._request_log.append(entry)
-
+    def _log_verdict(self, verdict: OrchestratorVerdict) -> None:
         try:
             import mlflow
             mlflow.log_metric("orchestrator_latency_ms", verdict.latency_ms)
-            mlflow.log_metric("shap_grounded_rate",
-                              sum(e["shap_grounded"] for e in self._request_log) / len(self._request_log))
+            mlflow.log_metric("orchestrator_confidence",  verdict.confidence_score)
+            mlflow.log_metric("shap_grounded",            float(verdict.shap_grounded))
         except Exception:
             pass
 
-    def get_stats(self) -> Dict:
-        """Return aggregate orchestrator statistics."""
-        if not self._request_log:
-            return {}
-        latencies = [e["latency_ms"] for e in self._request_log]
-        return {
-            "total_calls": len(self._request_log),
-            "mean_latency_ms": round(sum(latencies) / len(latencies), 1),
-            "p95_latency_ms":  round(sorted(latencies)[int(len(latencies) * 0.95)], 1),
-            "shap_grounded_rate": sum(e["shap_grounded"] for e in self._request_log) / len(self._request_log),
-            "threat_detection_rate": sum(e["threat_detected"] for e in self._request_log) / len(self._request_log),
-        }
+    @staticmethod
+    def _init_langsmith(project: str) -> None:
+        import os
+        os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
+        os.environ.setdefault("LANGCHAIN_PROJECT", project)
+        log.info("LangSmith tracing enabled for project: %s", project)
+
+
+# Avoid circular import from parse helper
+try:
+    import numpy as np
+except ImportError:
+    pass

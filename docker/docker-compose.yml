@@ -1,31 +1,80 @@
 version: "3.9"
+
 services:
-  netsentinel:
-    build: ..
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: netsentinel_dashboard
     ports:
-      - "8501:8501"   # Streamlit dashboard
-      - "8000:8000"   # Prometheus metrics
+      - "8501:8501"
     volumes:
-      - ../data:/app/data
-      - ../models:/app/models
-      - ../mlruns:/app/mlruns
+      - ../models:/app/models:ro
+      - ../data:/app/data:ro
     environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_SERVER_PORT=8501
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - LANGCHAIN_API_KEY=${LANGCHAIN_API_KEY}
-      - LANGCHAIN_TRACING_V2=true
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY:-}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    depends_on:
+      - mlflow
+      - prometheus
     restart: unless-stopped
+    networks:
+      - sentinel_net
 
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.13.0
+    image: ghcr.io/mlflow/mlflow:v2.12.2
+    container_name: netsentinel_mlflow
     ports:
       - "5000:5000"
     volumes:
-      - ../mlruns:/mlruns
-    command: mlflow server --host 0.0.0.0 --backend-store-uri /mlruns
+      - mlflow_data:/mlflow
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+    networks:
+      - sentinel_net
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.51.2
+    container_name: netsentinel_prometheus
     ports:
       - "9090:9090"
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    networks:
+      - sentinel_net
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: netsentinel_grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-netsentinel}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    networks:
+      - sentinel_net
+
+networks:
+  sentinel_net:
+    driver: bridge
+
+volumes:
+  mlflow_data:
+  prometheus_data:
+  grafana_data:

@@ -1,230 +1,232 @@
 """
-NetSentinel-RL — Unit & Integration Tests
-Run with: pytest tests/ -v
+NetSentinel-RL — Agent Test Suite
+Unit and integration tests for the RL agents and environment.
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pytest
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture
+N_SAMPLES  = 500
+N_FEATURES = 21
+
+
+@pytest.fixture(scope="module")
 def synthetic_data():
-    """Small synthetic dataset for fast tests."""
-    np.random.seed(42)
-    n, d = 200, 27
-    X = np.random.randn(n, d).astype(np.float32)
-    y = np.random.choice([0, 1, 2, 3], size=n, p=[0.6, 0.2, 0.1, 0.1]).astype(np.int32)
+    rng = np.random.default_rng(42)
+    X   = rng.standard_normal((N_SAMPLES, N_FEATURES)).astype(np.float32)
+    y   = rng.integers(0, 8, size=N_SAMPLES)
     return X, y
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def network_env(synthetic_data):
     from environment.network_env import NetworkEnv
     X, y = synthetic_data
-    return NetworkEnv(X, y, n_classes=4, max_steps=50, window_size=3)
+    return NetworkEnv(X, y, max_steps=100, window_size=5)
 
 
-@pytest.fixture
-def multi_agent_env(synthetic_data):
-    from environment.network_env import MultiAgentNetworkEnv
-    X, y = synthetic_data
-    return MultiAgentNetworkEnv(X, y, n_classes=4, max_steps=50)
-
-
-# ── Environment tests ─────────────────────────────────────────────────────────
+# ── NetworkEnv tests ──────────────────────────────────────────────────────────
 
 class TestNetworkEnv:
 
     def test_reset_returns_correct_shape(self, network_env):
-        obs, info = network_env.reset()
-        expected_shape = (27 * 3,)  # n_features * window_size
-        assert obs.shape == expected_shape
-        assert obs.dtype == np.float32
+        obs, info = network_env.reset(seed=0)
+        expected  = N_FEATURES * network_env.window_size
+        assert obs.shape == (expected,), f"Expected ({expected},), got {obs.shape}"
+        assert isinstance(info, dict)
 
-    def test_step_returns_correct_types(self, network_env):
-        network_env.reset()
+    def test_step_returns_valid_types(self, network_env):
+        network_env.reset(seed=1)
         obs, reward, terminated, truncated, info = network_env.step(0)
-        assert isinstance(reward, float)
+        assert isinstance(obs,        np.ndarray)
+        assert isinstance(reward,     float)
         assert isinstance(terminated, bool)
-        assert isinstance(truncated, bool)
-        assert "f1" in info
+        assert isinstance(truncated,  bool)
+        assert isinstance(info,       dict)
 
-    def test_episode_terminates_at_max_steps(self, network_env):
-        network_env.reset()
-        done = False
-        steps = 0
+    def test_reward_structure(self, network_env):
+        """TP reward must exceed TN; FN cost must be the most negative."""
+        env = network_env
+        assert env.TP_REWARD > env.TN_REWARD > 0
+        assert env.FN_COST   < env.FP_COST   < 0
+
+    def test_episode_terminates(self, network_env):
+        obs, _ = network_env.reset(seed=2)
+        done    = False
+        steps   = 0
         while not done:
-            _, _, done, _, _ = network_env.step(0)
+            obs, _, terminated, truncated, _ = network_env.step(network_env.action_space.sample())
+            done  = terminated or truncated
             steps += 1
         assert steps == network_env.max_steps
 
-    def test_reward_range(self, network_env):
-        """Rewards must be within expected bounds."""
-        network_env.reset()
-        rewards = []
-        for _ in range(20):
-            _, r, done, _, _ = network_env.step(np.random.randint(0, 2))
-            rewards.append(r)
-            if done:
-                break
-        for r in rewards:
-            assert -3.0 <= r <= 1.5, f"Reward {r} out of expected range"
+    def test_episode_info_contains_metrics(self, network_env):
+        env = network_env
+        env.reset(seed=3)
+        done = False
+        info = {}
+        while not done:
+            _, _, terminated, truncated, info = env.step(env.action_space.sample())
+            done = terminated or truncated
+        for key in ("f1", "precision", "recall", "tp", "tn", "fp", "fn"):
+            assert key in info, f"Missing key: {key}"
 
-    def test_info_keys_present(self, network_env):
-        network_env.reset()
-        _, _, _, _, info = network_env.step(1)
-        for key in ["step", "f1", "precision", "recall"]:
-            assert key in info
+    def test_observation_space_bounds(self, network_env):
+        obs, _ = network_env.reset(seed=4)
+        assert network_env.observation_space.contains(obs)
+
+    def test_multiple_resets_are_independent(self, network_env):
+        obs1, _ = network_env.reset(seed=10)
+        obs2, _ = network_env.reset(seed=11)
+        # Two different seeds should (almost certainly) yield different observations
+        assert not np.allclose(obs1, obs2)
 
 
-class TestMultiAgentEnv:
+# ── Detector agent tests ──────────────────────────────────────────────────────
 
-    def test_step_multi_returns_per_agent_rewards(self, multi_agent_env):
-        multi_agent_env.reset()
-        actions = {"detector": 1, "classifier": 1, "responder": 2}
-        obs, rewards, done, _, info = multi_agent_env.step_multi(actions)
-        assert set(rewards.keys()) == {"detector", "classifier", "responder"}
-        for r in rewards.values():
-            assert isinstance(r, float)
+class TestDetectorAgent:
 
-    def test_step_multi_info_has_response_action(self, multi_agent_env):
-        multi_agent_env.reset()
-        _, _, _, _, info = multi_agent_env.step_multi(
-            {"detector": 1, "classifier": 2, "responder": 2}
+    def test_attention_extractor_output_shape(self, synthetic_data):
+        import torch
+        from agents.detector_agent import AttentionFlowExtractor
+        import gymnasium as gym
+
+        n_feat = N_FEATURES
+        win    = 5
+        obs_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(n_feat * win,), dtype=np.float32
         )
-        assert "response_action" in info
-        assert info["response_action"] in multi_agent_env.RESPONSE_ACTIONS.values()
+        extractor = AttentionFlowExtractor(obs_space, n_features=n_feat, window_size=win, d_model=64)
+        x         = torch.randn(8, n_feat * win)
+        out       = extractor(x)
+        assert out.shape == (8, 64), f"Unexpected extractor output shape: {out.shape}"
+
+    def test_build_detector_returns_ppo(self, synthetic_data):
+        from stable_baselines3 import PPO
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.monitor import Monitor
+        from environment.network_env import NetworkEnv
+        from agents.detector_agent import build_detector
+
+        X, y = synthetic_data
+        env   = DummyVecEnv([lambda: Monitor(NetworkEnv(X, y, max_steps=50, window_size=5))])
+        model = build_detector(env, n_features=N_FEATURES, window_size=5)
+        assert isinstance(model, PPO)
 
 
-# ── Preprocessing tests ───────────────────────────────────────────────────────
+# ── Responder agent tests ─────────────────────────────────────────────────────
+
+class TestResponderAgent:
+
+    def test_reward_tp_exceeds_tn(self):
+        from agents.responder_agent import compute_responder_reward
+        r_block_threat  = compute_responder_reward(2, True,  "DDoS")
+        r_noact_benign  = compute_responder_reward(0, False, "Benign")
+        assert r_block_threat > r_noact_benign
+
+    def test_false_block_is_worst_outcome(self):
+        from agents.responder_agent import compute_responder_reward
+        r_false_block  = compute_responder_reward(2, False, "Benign")   # block_ip on benign
+        r_missed_alert = compute_responder_reward(0, True,  "DDoS")     # no_action on threat
+        # Both bad; false block should be heavily penalised
+        assert r_false_block < 0
+        assert r_missed_alert < 0
+
+    def test_response_actions_complete(self):
+        from agents.responder_agent import RESPONSE_ACTIONS, N_ACTIONS
+        assert len(RESPONSE_ACTIONS) == N_ACTIONS
+        assert set(RESPONSE_ACTIONS.values()) == {
+            "no_action", "alert_soc", "block_ip", "rate_limit", "deep_inspect"
+        }
+
+
+# ── Classifier agent tests ─────────────────────────────────────────────────────
+
+class TestClassifierAgent:
+
+    def test_attack_names_length(self):
+        from agents.classifier_agent import ATTACK_NAMES, N_CLASSES
+        assert len(ATTACK_NAMES) == N_CLASSES == 8
+
+    def test_flow_text_dataset_length(self):
+        from agents.classifier_agent import FlowTextDataset
+        from transformers import AutoTokenizer
+
+        texts     = ["syn_flags 5 | flow_duration 1.2s | pkt_rate 200pps"] * 10
+        labels    = np.zeros(10, dtype=int)
+        tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+        ds        = FlowTextDataset(texts, labels, tokenizer, max_length=64)
+        assert len(ds) == 10
+        sample = ds[0]
+        assert "input_ids" in sample
+        assert "labels"    in sample
+
+
+# ── Data preprocessing tests ──────────────────────────────────────────────────
 
 class TestPreprocessing:
 
-    def test_flow_text_encoder(self):
-        from data.preprocess import FlowTextEncoder
-        encoder = FlowTextEncoder()
-        row = {
-            "Flow Duration": 1234,
-            "Total Fwd Packets": 10,
-            "Total Backward Packets": 8,
-            "Flow Bytes/s": 50000,
-            "SYN Flag Count": 1,
-            "RST Flag Count": 0,
-            "ACK Flag Count": 7,
-            "Fwd PSH Flags": 1,
-            "Fwd URG Flags": 0,
-            "Flow IAT Mean": 100,
-            "Avg Packet Size": 500,
-            "Down/Up Ratio": 1.2,
-        }
-        text = encoder.encode_flow(row)
-        assert "flow:" in text
-        assert "flags:" in text
-        assert "stats:" in text
-        assert "duration=1234ms" in text
+    def test_clip_outlier_transformer(self):
+        from data.preprocess import ClipOutlierTransformer
+        rng = np.random.default_rng(0)
+        X   = rng.standard_normal((200, 5)).astype(np.float32)
+        t   = ClipOutlierTransformer(clip_percentile=95.0)
+        t.fit(X)
+        out = t.transform(X)
+        assert out.shape == X.shape
+        assert out.dtype == np.float32
 
-    def test_network_flow_transformer(self):
-        from data.preprocess import NetworkFlowTransformer
-        import pandas as pd
-        transformer = NetworkFlowTransformer()
-        X = pd.DataFrame({
-            "Flow Duration": [100, 200, np.inf],
-            "Total Fwd Packets": [5, 10, 3],
-            "Total Backward Packets": [4, 8, 2],
-            "Flow Bytes/s": [1000, 2000, 500],
-            "Flow Packets/s": [10, 20, 5],
-        })
-        X_fit = transformer.fit_transform(X)
-        assert not np.any(np.isnan(X_fit))
-        assert not np.any(np.isinf(X_fit))
+    def test_flow_text_encoder_output_type(self):
+        from data.preprocess import FlowTextEncoder, FLOW_FEATURES
+        rng  = np.random.default_rng(1)
+        data = {feat: rng.exponential(1.0, size=5) for feat in FLOW_FEATURES}
+        df   = __import__("pandas").DataFrame(data)
+        enc  = FlowTextEncoder()
+        texts = enc.transform(df)
+        assert len(texts) == 5
+        assert all(isinstance(t, str) for t in texts)
+        assert all(len(t) > 0 for t in texts)
 
 
 # ── Orchestrator tests ────────────────────────────────────────────────────────
 
 class TestOrchestrator:
 
-    def test_parse_valid_json(self):
-        from orchestrator.llm_orchestrator import LLMOrchestrator
-        orch = LLMOrchestrator(enable_langsmith=False)
-        raw = '{"threat_detected": true, "threat_type": "DoS", "severity": "high", "recommended_action": "block_ip", "explanation": "test", "confidence_score": 0.9, "reasoning_chain": "test"}'
-        parsed = orch._parse_and_validate(raw)
-        assert parsed["threat_detected"] is True
-        assert parsed["threat_type"] == "DoS"
+    def test_mock_verdict_structure(self):
+        from orchestrator.llm_orchestrator import LLMOrchestrator, AgentSignal
 
-    def test_parse_json_with_markdown_fences(self):
-        from orchestrator.llm_orchestrator import LLMOrchestrator
-        orch = LLMOrchestrator(enable_langsmith=False)
-        raw = '```json\n{"threat_detected": false, "threat_type": "Benign", "severity": "low", "recommended_action": "no_action", "explanation": "ok", "confidence_score": 0.95, "reasoning_chain": "clean"}\n```'
-        parsed = orch._parse_and_validate(raw)
-        assert parsed["threat_detected"] is False
-
-    def test_shap_grounding_check(self):
-        from orchestrator.llm_orchestrator import LLMOrchestrator
-        orch = LLMOrchestrator(enable_langsmith=False)
-        explanation = "High packet rate detected with anomalous SYN flags."
-        shap = {"Flow_Packets/s": 0.85, "SYN_Flag_Count": 0.72, "Avg_Packet_Size": 0.31}
-        assert orch._check_shap_grounding(explanation, shap) is True
-
-    def test_shap_grounding_fails_for_unrelated(self):
-        from orchestrator.llm_orchestrator import LLMOrchestrator
-        orch = LLMOrchestrator(enable_langsmith=False)
-        explanation = "Traffic seems suspicious."
-        shap = {"SYN_Flag_Count": 0.9, "Fwd_IAT_Mean": 0.6}
-        # "suspicious" doesn't match any feature name token
-        result = orch._check_shap_grounding(explanation, shap)
-        assert isinstance(result, bool)
-
-
-# ── Eval harness tests ────────────────────────────────────────────────────────
-
-class TestEvalHarness:
-
-    def test_hallucination_detection(self):
-        from llmops.llm_eval_harness import LLMEvalHarness
-        harness = LLMEvalHarness()
-        flags = harness._detect_hallucinations(
-            "This appears to be a nation-state ransomware attack with zero-day exploit.",
-            {}
+        orch = LLMOrchestrator()   # uses mock mode when anthropic unavailable
+        sig  = AgentSignal(
+            agent_name="detector-1",
+            action="block_ip",
+            confidence=0.92,
+            top_features={"SYN_Flag_Count": 0.31, "Flow_Packets/s": 0.22},
+            flow_stats={"threat_type": "DDoS", "src_ip": "10.0.1.1"},
         )
-        assert "nation-state" in flags
-        assert "ransomware" in flags
-        assert "zero-day" in flags
+        verdict = orch.synthesise([sig])
+        assert hasattr(verdict, "threat_detected")
+        assert hasattr(verdict, "severity")
+        assert hasattr(verdict, "recommended_action")
+        assert verdict.latency_ms >= 0
 
-    def test_clean_explanation_no_flags(self):
-        from llmops.llm_eval_harness import LLMEvalHarness
-        harness = LLMEvalHarness()
-        flags = harness._detect_hallucinations(
-            "High SYN flag rate with elevated packets per second. Blocked source IP.",
-            {"SYN_Flag_Count": 0.9}
-        )
-        assert len(flags) == 0
+    def test_fast_path_skips_llm(self):
+        from orchestrator.llm_orchestrator import LLMOrchestrator, AgentSignal
 
-    def test_report_generation(self):
-        from llmops.llm_eval_harness import LLMEvalHarness
-        harness = LLMEvalHarness()
-        for i in range(20):
-            harness.evaluate_sample(
-                flow_id=f"flow_{i}",
-                true_label=i % 4,
-                predicted_label=["Benign", "DoS", "DDoS", "PortScan"][i % 4],
-                confidence=0.85,
-                explanation="High packet rate with SYN anomaly.",
-                shap_features={"SYN_Flag_Count": 0.8, "Flow_Packets/s": 0.6},
-                latency_ms=45.0 + i,
-                recommended_action="block_ip",
-                shap_grounded=True,
+        orch = LLMOrchestrator()
+        signals = [
+            AgentSignal(
+                agent_name=f"detector-{i}",
+                action="block_ip",
+                confidence=0.95,
+                top_features={"SYN_Flag_Count": 0.4},
+                flow_stats={"threat_type": "DoS"},
             )
-        report = harness.generate_report(run_name="test_run")
-        assert report.n_samples == 20
-        assert 0 <= report.f1_weighted <= 1
-        assert report.p95_latency_ms >= report.p50_latency_ms
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+            for i in range(2)
+        ]
+        assert orch._should_fast_path(signals)
+        verdict = orch.synthesise(signals)
+        assert "Fast path" in verdict.reasoning_chain
