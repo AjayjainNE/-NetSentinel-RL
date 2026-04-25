@@ -539,7 +539,7 @@ with placeholder.container():
                 textfont=dict(size=9),
                 showscale=False,
             ))
-            fig_hm.update_layout(**base_layout(210)
+            fig_hm.update_layout(**base_layout(210))
             st.plotly_chart(fig_hm, use_container_width=True)
 
     with col_sev:
