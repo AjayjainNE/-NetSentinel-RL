@@ -487,7 +487,7 @@ with placeholder.container():
                     textposition="outside",
                     textfont=dict(size=8),
                 ))
-                fig_shap.update_layout(**base_layout(220),xaxis_title="Mean |SHAP|",margin=dict(l=0, r=50, t=20, b=10))
+                fig_shap.update_layout(**base_layout(220),xaxis_title="Mean |SHAP|")
                 st.plotly_chart(fig_shap, use_container_width=True)
 
     with col_g:
@@ -505,11 +505,12 @@ with placeholder.container():
                     textposition="outside",
                     textfont=dict(size=8),
                 ))
-                fig_src.update_layout(**base_layout(220), showlegend=False,
-                                       xaxis_title="Threat events",
-                                       margin=dict(l=0, r=40, t=20, b=10),
-                                       yaxis=dict(gridcolor="#1f2329", zeroline=False,
-                                                  tickfont=dict(size=8, family="DM Mono")))
+                layout = base_layout(220)
+
+                layout["yaxis"] = dict(gridcolor="#1f2329", zeroline=False,tickfont=dict(size=8, family="DM Mono"))
+
+                fig_src.update_layout(**layout,xaxis_title="Threat events"
+                                      )
                 st.plotly_chart(fig_src, use_container_width=True)
 
     # ── Row 5: Severity heatmap ───────────────────────────────────────────
